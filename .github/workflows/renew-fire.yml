@@ -12,6 +12,9 @@ jobs:
     container:
       image: mcr.microsoft.com/playwright:v1.61.0-jammy
     timeout-minutes: 30
+    # 允许 GITHUB_TOKEN 推送 screenshots 图床分支
+    permissions:
+      contents: write
 
     steps:
       - name: 克隆当前仓库 (Clone current repo)
@@ -44,6 +47,85 @@ jobs:
         run: | 
           echo ${{ secrets.SPARK_MESSAGE_TEMPLATE }}
           bun src/main.ts
+
+      - name: 上传失败截图到仓库图床 (Upload failure screenshots)
+        if: ${{ failure() && env.FTQQ_SENDKEY != '' }}
+        env:
+          FTQQ_SENDKEY: ${{ secrets.FTQQ_SENDKEY }}
+          TZ: Asia/Shanghai
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          screenshots=(artifacts/*.png)
+
+          # 没有截图（如依赖安装失败）时直接跳过，不影响后续通知
+          if [ ${#screenshots[@]} -eq 0 ]; then
+            echo "SCREENSHOT_MARKDOWN=" >> "$GITHUB_ENV"
+            echo "没有失败截图，跳过图床上传"
+            exit 0
+          fi
+
+          run_dir="$(date +%Y-%m-%d)/run-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 把截图提交到独立的 screenshots 分支，用 raw 链接充当图床
+          if git ls-remote --exit-code origin screenshots >/dev/null 2>&1; then
+            git fetch origin screenshots
+            git checkout -B screenshots FETCH_HEAD
+          else
+            git switch --orphan screenshots
+          fi
+
+          mkdir -p "screenshots/${run_dir}"
+          cp artifacts/*.png "screenshots/${run_dir}/"
+          git add "screenshots/${run_dir}"
+
+          # 只保留最近 14 天的截图，避免图床分支无限膨胀
+          cutoff="$(date -d '14 days ago' +%s)"
+          for dir in screenshots/*/; do
+            day="${dir#screenshots/}"
+            day="${day%/}"
+            if [[ "$day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && dir_ts="$(date -d "$day" +%s)" && [ "$dir_ts" -lt "$cutoff" ]; then
+              git rm -r --quiet "$dir"
+            fi
+          done
+
+          if ! git diff --cached --quiet 2>/dev/null; then
+            git commit -m "chore: 上传失败截图 run-${GITHUB_RUN_ID}"
+            if ! git push origin screenshots; then
+              # 极小概率与并发任务冲突，同步远端后重试一次
+              git pull --rebase origin screenshots
+              git push origin screenshots
+            fi
+          else
+            echo "截图内容与图床分支一致，无需提交"
+          fi
+
+          # 生成 Markdown 图片语法，写入环境变量供微信推送步骤引用
+          python3 - "$run_dir" <<'PYEOF'
+          import glob
+          import os
+          import sys
+          import urllib.parse
+
+          run_dir = sys.argv[1]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          env_file = os.environ["GITHUB_ENV"]
+          parts = []
+          for path in sorted(glob.glob("artifacts/*.png")):
+              name = os.path.basename(path)
+              quoted = "/".join(urllib.parse.quote(part) for part in (run_dir, name))
+              raw_url = f"https://raw.githubusercontent.com/{repo}/screenshots/{quoted}"
+              cdn_url = f"https://cdn.jsdelivr.net/gh/{repo}@screenshots/{quoted}"
+              parts.append(f"![{name}]({raw_url})\n\n[备用线路查看]({cdn_url})")
+          content = "\n\n".join(parts)
+          with open(env_file, "a", encoding="utf-8", newline="\n") as f:
+              f.write(f"SCREENSHOT_MARKDOWN<<SCREENSHOT_EOF\n{content}\nSCREENSHOT_EOF\n")
+          print(f"已生成 {len(parts)} 张截图的微信推送内容")
+          PYEOF
+          echo "已上传失败截图：screenshots/${run_dir}"
 
       - name: 发送失败邮件 (Send failure email)
         if: ${{ failure() }}
@@ -104,6 +186,11 @@ jobs:
           if os.environ.get("EVENT_NAME") == "workflow_dispatch":
               title += "【手动触发】"
               desp += "\n\n【手动触发】"
+
+          # 失败时把图床分支上的截图以 Markdown 图片嵌入推送正文
+          screenshot_markdown = os.environ.get("SCREENSHOT_MARKDOWN", "").strip()
+          if screenshot_markdown:
+              desp += "\n\n### 失败现场截图\n\n" + screenshot_markdown
 
           data = urllib.parse.urlencode({"title": title, "desp": desp}).encode()
           req = urllib.request.Request(
