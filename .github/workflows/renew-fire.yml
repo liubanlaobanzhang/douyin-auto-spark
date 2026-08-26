@@ -55,12 +55,18 @@ jobs:
           TZ: Asia/Shanghai
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          shopt -s nullglob
-          screenshots=(artifacts/*.png)
+          set -eu
+
+          # Playwright 容器镜像不含 bash，以下全部使用 POSIX sh 语法
+          has_screenshot=""
+          for file in artifacts/*.png; do
+            [ -f "$file" ] || continue
+            has_screenshot="$file"
+            break
+          done
 
           # 没有截图（如依赖安装失败）时直接跳过，不影响后续通知
-          if [ ${#screenshots[@]} -eq 0 ]; then
+          if [ -z "$has_screenshot" ]; then
             echo "SCREENSHOT_MARKDOWN=" >> "$GITHUB_ENV"
             echo "没有失败截图，跳过图床上传"
             exit 0
@@ -79,17 +85,26 @@ jobs:
           fi
 
           mkdir -p "screenshots/${run_dir}"
-          cp artifacts/*.png "screenshots/${run_dir}/"
+          for file in artifacts/*.png; do
+            [ -f "$file" ] || continue
+            cp "$file" "screenshots/${run_dir}/"
+          done
           git add "screenshots/${run_dir}"
 
           # 只保留最近 14 天的截图，避免图床分支无限膨胀
           cutoff="$(date -d '14 days ago' +%s)"
           for dir in screenshots/*/; do
+            [ -d "$dir" ] || continue
             day="${dir#screenshots/}"
             day="${day%/}"
-            if [[ "$day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && dir_ts="$(date -d "$day" +%s)" && [ "$dir_ts" -lt "$cutoff" ]; then
-              git rm -r --quiet "$dir"
-            fi
+            case "$day" in
+              [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+                dir_ts="$(date -d "$day" +%s 2>/dev/null || echo 0)"
+                if [ "$dir_ts" -lt "$cutoff" ]; then
+                  git rm -r --quiet "$dir"
+                fi
+                ;;
+            esac
           done
 
           if ! git diff --cached --quiet 2>/dev/null; then
