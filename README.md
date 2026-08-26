@@ -109,7 +109,7 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 
 配置 `MAIL_ADDRESS`、`MAIL_USERNAME` 和 `MAIL_PASSWORD` 后，续火失败会向 `MAIL_ADDRESS` 发送提醒邮件，并附带失败图片。
 
-配置 `FTQQ_SENDKEY` 后，任务成功或失败都会通过 Server酱 推送到微信。失败时，脚本自动保存的失败截图会被提交到仓库的 `screenshots` 分支（相当于用仓库本身当图床），并以 Markdown 图片的形式嵌入微信推送正文，点开通知即可直接看到失败现场；每张图片同时附带 jsDelivr 备用线路链接，防止 `raw.githubusercontent.com` 无法访问。截图按日期存放在 `screenshots` 分支下，只保留最近 14 天，过期后自动清理，不会让仓库无限膨胀。
+配置 `FTQQ_SENDKEY` 后，任务成功或失败都会通过 Server酱 推送到微信；**手动触发**（Actions 页面点击 Run workflow）的运行不会发送微信通知，方便测试时不打扰。失败时，脚本自动保存的失败截图会被上传到仓库的 `screenshots` 分支（相当于用仓库本身当图床），并以 Markdown 图片的形式嵌入微信推送正文，点开通知即可直接看到失败现场；每张图片同时附带 jsDelivr 备用线路链接，防止 `raw.githubusercontent.com` 无法访问。截图文件名自带日期，只保留最近 14 天，过期后自动清理，不会让仓库无限膨胀。
 
 #### 3️⃣ 手动运行一次
 

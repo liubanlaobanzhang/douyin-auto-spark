@@ -55,92 +55,131 @@ jobs:
           TZ: Asia/Shanghai
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eu
-
-          # Playwright 容器镜像不含 bash，以下全部使用 POSIX sh 语法
-          has_screenshot=""
-          for file in artifacts/*.png; do
-            [ -f "$file" ] || continue
-            has_screenshot="$file"
-            break
-          done
-
-          # 没有截图（如依赖安装失败）时直接跳过，不影响后续通知
-          if [ -z "$has_screenshot" ]; then
-            echo "SCREENSHOT_MARKDOWN=" >> "$GITHUB_ENV"
-            echo "没有失败截图，跳过图床上传"
-            exit 0
-          fi
-
-          run_dir="$(date +%Y-%m-%d)/run-${GITHUB_RUN_ID}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # 把截图提交到独立的 screenshots 分支，用 raw 链接充当图床
-          if git ls-remote --exit-code origin screenshots >/dev/null 2>&1; then
-            git fetch origin screenshots
-            git checkout -B screenshots FETCH_HEAD
-          else
-            git switch --orphan screenshots
-          fi
-
-          mkdir -p "screenshots/${run_dir}"
-          for file in artifacts/*.png; do
-            [ -f "$file" ] || continue
-            cp "$file" "screenshots/${run_dir}/"
-          done
-          git add "screenshots/${run_dir}"
-
-          # 只保留最近 14 天的截图，避免图床分支无限膨胀
-          cutoff="$(date -d '14 days ago' +%s)"
-          for dir in screenshots/*/; do
-            [ -d "$dir" ] || continue
-            day="${dir#screenshots/}"
-            day="${day%/}"
-            case "$day" in
-              [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
-                dir_ts="$(date -d "$day" +%s 2>/dev/null || echo 0)"
-                if [ "$dir_ts" -lt "$cutoff" ]; then
-                  git rm -r --quiet "$dir"
-                fi
-                ;;
-            esac
-          done
-
-          if ! git diff --cached --quiet 2>/dev/null; then
-            git commit -m "chore: 上传失败截图 run-${GITHUB_RUN_ID}"
-            if ! git push origin screenshots; then
-              # 极小概率与并发任务冲突，同步远端后重试一次
-              git pull --rebase origin screenshots
-              git push origin screenshots
-            fi
-          else
-            echo "截图内容与图床分支一致，无需提交"
-          fi
-
-          # 生成 Markdown 图片语法，写入环境变量供微信推送步骤引用
-          python3 - "$run_dir" <<'PYEOF'
+          # 通过 GitHub REST API 把截图直传仓库 screenshots 分支（图床），不依赖本地 git 仓库
+          python3 - <<'PYEOF'
+          import base64
+          import datetime
           import glob
+          import json
           import os
           import sys
+          import urllib.error
           import urllib.parse
+          import urllib.request
 
-          run_dir = sys.argv[1]
           repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          run_id = os.environ["GITHUB_RUN_ID"]
           env_file = os.environ["GITHUB_ENV"]
-          parts = []
-          for path in sorted(glob.glob("artifacts/*.png")):
+          api_base = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          branch = "screenshots"
+          retention_days = 14
+          api = f"{api_base}/repos/{repo}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "douyin-auto-spark",
+          }
+
+          def req(method, url, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              request = urllib.request.Request(url, data=data, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as resp:
+                      body = resp.read().decode()
+                      return resp.status, (json.loads(body) if body else {})
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode()
+                  try:
+                      return error.code, json.loads(body)
+                  except Exception:
+                      return error.code, {}
+
+          files = sorted(glob.glob("artifacts/*.png"))
+          if not files:
+              with open(env_file, "a", encoding="utf-8", newline="\n") as f:
+                  f.write("SCREENSHOT_MARKDOWN=\n")
+              print("没有失败截图，跳过图床上传")
+              sys.exit(0)
+
+          today = datetime.datetime.now().strftime("%Y-%m-%d")
+
+          # 图床分支不存在时，基于默认分支创建
+          status, data = req("GET", f"{api}/branches/{branch}")
+          if status == 404:
+              status, data = req("GET", f"{api}")
+              default_branch = data["default_branch"]
+              status, data = req("GET", f"{api}/git/ref/heads/{default_branch}")
+              status, data = req(
+                  "POST",
+                  f"{api}/git/refs",
+                  {"ref": f"refs/heads/{branch}", "sha": data["object"]["sha"]},
+              )
+              if status not in (200, 201):
+                  print("创建图床分支失败:", status, data)
+                  sys.exit(1)
+              print("已创建图床分支:", branch)
+
+          # 逐张上传截图（扁平结构：文件名自带日期与运行 ID，便于按日期清理）
+          for path in files:
               name = os.path.basename(path)
-              quoted = "/".join(urllib.parse.quote(part) for part in (run_dir, name))
-              raw_url = f"https://raw.githubusercontent.com/{repo}/screenshots/{quoted}"
-              cdn_url = f"https://cdn.jsdelivr.net/gh/{repo}@screenshots/{quoted}"
+              remote_name = f"{today}-run-{run_id}-{name}"
+              remote_path = f"screenshots/{remote_name}"
+              with open(path, "rb") as f:
+                  content = base64.b64encode(f.read()).decode()
+              status, data = req(
+                  "PUT",
+                  f"{api}/contents/{urllib.parse.quote(remote_path, safe='/')}",
+                  {
+                      "message": f"chore: 上传失败截图 run-{run_id}",
+                      "content": content,
+                      "branch": branch,
+                  },
+              )
+              if status not in (200, 201):
+                  print("上传截图失败:", status, data)
+                  sys.exit(1)
+              print("已上传:", remote_path)
+
+          # 清理超过保留期的截图（文件名前 10 位是日期 YYYY-MM-DD）
+          cutoff = datetime.date.today() - datetime.timedelta(days=retention_days)
+          status, data = req("GET", f"{api}/contents/screenshots?ref={branch}")
+          if status == 200 and isinstance(data, list):
+              for entry in data:
+                  name = entry.get("name", "")
+                  try:
+                      day_date = datetime.date.fromisoformat(name[:10])
+                  except ValueError:
+                      continue
+                  if day_date >= cutoff:
+                      continue
+                  file_path = entry["path"]
+                  status, _ = req(
+                      "DELETE",
+                      f"{api}/contents/{urllib.parse.quote(file_path, safe='/')}",
+                      {
+                          "message": f"chore: 清理过期截图 {name[:10]}",
+                          "branch": branch,
+                          "sha": entry["sha"],
+                      },
+                  )
+                  if status in (200, 202):
+                      print("已清理:", file_path)
+
+          # 生成 Markdown 图片语法写入环境变量，供微信推送正文引用
+          parts = []
+          for path in files:
+              name = os.path.basename(path)
+              quoted = urllib.parse.quote(f"{today}-run-{run_id}-{name}")
+              raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/screenshots/{quoted}"
+              cdn_url = f"https://cdn.jsdelivr.net/gh/{repo}@{branch}/screenshots/{quoted}"
               parts.append(f"![{name}]({raw_url})\n\n[备用线路查看]({cdn_url})")
           content = "\n\n".join(parts)
           with open(env_file, "a", encoding="utf-8", newline="\n") as f:
               f.write(f"SCREENSHOT_MARKDOWN<<SCREENSHOT_EOF\n{content}\nSCREENSHOT_EOF\n")
-          print(f"已生成 {len(parts)} 张截图的微信推送内容")
+          print(f"已生成 {len(files)} 张截图的微信推送内容")
           PYEOF
-          echo "已上传失败截图：screenshots/${run_dir}"
 
       - name: 发送失败邮件 (Send failure email)
         if: ${{ failure() }}
@@ -163,6 +202,7 @@ jobs:
             https://github.com/bling-yshs/douyin-auto-spark/issues
 
       - name: 发送构建失败通知
+        # 手动触发的运行跳过微信通知（测试时避免打扰）
         if: ${{ failure() && env.FTQQ_SENDKEY != '' }}
         env:
           FTQQ_SENDKEY: ${{ secrets.FTQQ_SENDKEY }}
@@ -216,7 +256,8 @@ jobs:
           PYEOF
 
       - name: 发送构建成功通知
-        if: ${{ success() && env.FTQQ_SENDKEY != '' }}
+        # 手动触发的运行跳过微信通知（测试时避免打扰）
+        if: ${{ success() && env.FTQQ_SENDKEY != '' && env.EVENT_NAME != 'workflow_dispatch' }}
         env:
           FTQQ_SENDKEY: ${{ secrets.FTQQ_SENDKEY }}
           TZ: Asia/Shanghai
