@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import { chromium, type Browser, type Cookie, type Locator, type Page } from 'playwright'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import dayjs from 'dayjs'
@@ -20,6 +20,10 @@ const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
 const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
 const SPARK_MESSAGE_TEMPLATE_KEY = 'SPARK_MESSAGE_TEMPLATE'
 const FAILURE_SCREENSHOT_DIRECTORY = 'artifacts'
+const OPERATION_SCREENSHOT_DIRECTORY = 'artifacts/operations'
+const SCREENSHOT_RETENTION_DAYS = 3
+const GITHUB_EVENT_NAME_KEY = 'GITHUB_EVENT_NAME'
+const OPERATION_SCREENSHOTS_KEY = 'OPERATION_SCREENSHOTS'
 
 const CHAT_PAGE_READY_TIMEOUT = 30000
 const CHAT_PAGE_IDLE_TIMEOUT = 10000
@@ -59,6 +63,7 @@ async function main(): Promise<void> {
   const globalMessageTemplate = resolveSparkMessageTemplate()
   const accounts = resolveDouyinAccounts(globalMessageTemplate)
   const yiyans = await resolveYiyans()
+  await cleanupExpiredScreenshots()
   const browser = await chromium.launch({
     headless,
     ...(browserPath ? { executablePath: browserPath } : {}),
@@ -125,6 +130,7 @@ async function runDouyinAccount(
     await page.goto('https://www.douyin.com/chat', {
       waitUntil: 'domcontentloaded',
     })
+    await captureOperationScreenshot(page, account.name, '打开聊天页')
 
     const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
     const searchVisible = await searchInput
@@ -136,7 +142,10 @@ async function runDouyinAccount(
       throw new Error('聊天页搜索框未出现，Cookie 可能已经失效')
     }
 
+    await captureOperationScreenshot(page, account.name, '搜索框就绪')
+
     await waitForChatListReady(page, account.name)
+    await captureOperationScreenshot(page, account.name, '会话列表就绪')
 
     // 记录未命中的会话，等其余好友都发完再统一报错，避免一个人改名连累当天所有人。
     const missingNames: string[] = []
@@ -150,14 +159,18 @@ async function runDouyinAccount(
       const searchResult = await searchConversation(page, searchInput, account.name, targetName)
 
       if (!searchResult) {
+        await captureOperationScreenshot(page, account.name, `搜索未命中-${targetName}`)
         await captureFailureScreenshot(page, `${account.name}-${targetName}-search`)
         console.log(`[${account.name}] 找不到搜索结果，已跳过：${targetName}`)
         missingNames.push(targetName)
         continue
       }
 
+      await captureOperationScreenshot(page, account.name, `搜索命中-${targetName}`)
+
       await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
       console.log(`[${account.name}] 已打开私信：${targetName}`)
+      await captureOperationScreenshot(page, account.name, `打开私信-${targetName}`)
 
       const editorInput = page
         .locator(
@@ -166,6 +179,7 @@ async function runDouyinAccount(
         .first()
       await editorInput.waitFor({ state: 'visible', timeout: 10000 })
       await editorInput.click()
+      await captureOperationScreenshot(page, account.name, `编辑器就绪-${targetName}`)
 
       let message: string
 
@@ -182,7 +196,9 @@ async function runDouyinAccount(
       }
 
       await page.keyboard.insertText(message)
+      await captureOperationScreenshot(page, account.name, `消息已输入-${targetName}`)
       await page.keyboard.press('Enter')
+      await captureOperationScreenshot(page, account.name, `消息已发送-${targetName}`)
       console.log(`[${account.name}] 已发送消息：${targetName}`)
       await page.waitForTimeout(1000)
     }
@@ -317,6 +333,74 @@ function toSafeFileName(value: string): string {
   return value.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]+/g, '-').replace(/^-+|-+$/g, '') || 'account'
 }
 
+/**
+ * 每次浏览器操作后保存一张现场截图，便于事后回溯每一步的页面状态。
+ *
+ * 截图保存在 artifacts/operations 下，文件名带时间戳、账号名和步骤名；
+ * 保存后顺带清理超过 {@link SCREENSHOT_RETENTION_DAYS} 天的旧截图。
+ */
+async function captureOperationScreenshot(
+  page: Page | undefined,
+  accountName: string,
+  stepName: string,
+): Promise<void> {
+  if (!page || page.isClosed()) {
+    return
+  }
+
+  // 定时触发的 Actions 不保存逐步截图，避免每天产生大量文件；手动触发和本地运行才保存。
+  if (!resolveOperationScreenshotsEnabled()) {
+    return
+  }
+
+  try {
+    await mkdir(OPERATION_SCREENSHOT_DIRECTORY, { recursive: true })
+    const timestamp = dayjs().format('YYYYMMDD-HHmmss-SSS')
+    const screenshotPath = `${OPERATION_SCREENSHOT_DIRECTORY}/${timestamp}-${toSafeFileName(accountName)}-${toSafeFileName(stepName)}.png`
+    await page.screenshot({ path: screenshotPath })
+    console.log(`已保存操作截图：${screenshotPath}`)
+    await cleanupExpiredScreenshots()
+  } catch (error) {
+    console.error('保存操作截图失败:', error)
+  }
+}
+
+/**
+ * 清理超过 {@link SCREENSHOT_RETENTION_DAYS} 天的操作截图，按文件修改时间判断。
+ *
+ * 目录不存在时视为无需清理；单个文件清理失败只记日志，不影响其余文件。
+ */
+async function cleanupExpiredScreenshots(): Promise<void> {
+  let entries: string[]
+
+  try {
+    entries = await readdir(OPERATION_SCREENSHOT_DIRECTORY)
+  } catch {
+    return
+  }
+
+  const cutoff = Date.now() - SCREENSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000
+
+  for (const entry of entries) {
+    if (!entry.endsWith('.png')) {
+      continue
+    }
+
+    const filePath = `${OPERATION_SCREENSHOT_DIRECTORY}/${entry}`
+
+    try {
+      const fileStat = await stat(filePath)
+      if (fileStat.mtimeMs >= cutoff) {
+        continue
+      }
+      await unlink(filePath)
+      console.log(`已清理过期操作截图：${filePath}`)
+    } catch (error) {
+      console.error('清理操作截图失败:', filePath, error)
+    }
+  }
+}
+
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error))
 }
@@ -332,6 +416,27 @@ function resolveBrowserPath(): string | undefined {
   }
 
   return undefined
+}
+
+/**
+ * 解析是否保存逐步操作截图。
+ *
+ * 可通过 OPERATION_SCREENSHOTS 显式开启（true）或关闭（false）；
+ * 未配置时按触发方式推断：GitHub Actions 定时触发（GITHUB_EVENT_NAME=schedule）不截图，
+ * 手动触发（workflow_dispatch）和本地运行（未设置该变量）时截图，便于回溯调试。
+ */
+function resolveOperationScreenshotsEnabled(): boolean {
+  const explicit = process.env[OPERATION_SCREENSHOTS_KEY]?.trim().toLowerCase()
+
+  if (explicit === 'true') {
+    return true
+  }
+
+  if (explicit === 'false') {
+    return false
+  }
+
+  return process.env[GITHUB_EVENT_NAME_KEY] !== 'schedule'
 }
 
 /**
