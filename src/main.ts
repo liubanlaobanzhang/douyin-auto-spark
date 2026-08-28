@@ -25,6 +25,9 @@ const SCREENSHOT_RETENTION_DAYS = 3
 const GITHUB_EVENT_NAME_KEY = 'GITHUB_EVENT_NAME'
 const OPERATION_SCREENSHOTS_KEY = 'OPERATION_SCREENSHOTS'
 
+// 通过 X-Forwarded-For 伪装请求来源 IP，配合风控/定位场景使用。
+const X_FORWARDED_FOR = '223.80.166.59'
+
 const CHAT_PAGE_READY_TIMEOUT = 30000
 const CHAT_PAGE_IDLE_TIMEOUT = 10000
 const SEARCH_RESULT_TIMEOUT = 5000
@@ -119,7 +122,11 @@ async function runDouyinAccount(
   includeYiyanSource: boolean,
   autoClose: boolean,
 ): Promise<void> {
-  const context = await browser.newContext()
+  const context = await browser.newContext({
+    extraHTTPHeaders: {
+      'X-Forwarded-For': X_FORWARDED_FOR,
+    },
+  })
   let page: Page | undefined
 
   try {
